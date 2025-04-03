@@ -4,292 +4,195 @@ import time
 import google.generativeai as genai
 from pdf_processor2 import process_pdf
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import tempfile
+import shutil
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Configuration
-UPLOAD_FOLDER = "uploads"
-OUTPUT_FOLDER = "outputs"
+UPLOAD_FOLDER = tempfile.mkdtemp()
+OUTPUT_FOLDER = tempfile.mkdtemp()
 MAX_FILE_SIZE = 200  # MB
-GEMINI_API_KEY = "AIzaSyDMCXugVyrMIFP4KH1DJ56uBE6wMDWODgc"
-MAX_SECTION_LENGTH = 10000  # Characters per section chunk
-MAX_QUESTIONS_PER_CHUNK = 10  # Process questions in batches
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # From environment variable
+MAX_QUESTION_TOKENS = 4000  # Tokens per individual question
+DELAY_BETWEEN_QUESTIONS = 1  # Seconds
+MAX_REQUESTS_PER_MINUTE = 60  # Gemini's free tier limit
 
 # Initialize Gemini
+if not GEMINI_API_KEY:
+    st.error("Gemini API key not configured. Please set GEMINI_API_KEY environment variable.")
+    st.stop()
+
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel('gemini-1.5-flash')
 
-# Create directories
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-
 st.set_page_config(
-    page_title="PDF to HTML Converter",
-    page_icon="📄",
+    page_title="Complete Question Processor",
+    page_icon="📝",
     layout="wide"
 )
 
+def cleanup():
+    """Clean up temporary directories"""
+    for folder in [UPLOAD_FOLDER, OUTPUT_FOLDER]:
+        try:
+            shutil.rmtree(folder, ignore_errors=True)
+        except Exception as e:
+            st.warning(f"Couldn't remove {folder}: {e}")
+
 def refine_extracted_text(raw_text):
-    """Clean and structure the raw extracted text using Gemini"""
+    """Clean and structure the raw extracted text"""
     prompt = f"""
-    Please refine and structure this raw text extracted from a question paper PDF:
+    Extract and structure all questions from this exam paper text:
+    1. Preserve original numbering and sub-parts (a, b, c)
+    2. Keep complete mathematical notation
+    3. Remove headers/footers/page numbers
     
-    Requirements:
-    1. Correct any OCR errors
-    2. Maintain original section structure
-    3. Preserve all question numbers
-    4. Keep complete questions with sub-parts
-    5. Remove page numbers, headers, footers
-    6. Format clearly with section headers
-    7. Preserve mathematical notation
-    8. Ensure all text is in English
+    Return in this exact format:
+    [Q.No]. [Full Question Text]
+    [Sub-part a]. [Question text]
+    [Sub-part b]. [Question text]
     
-    Important:
-    - DO NOT omit any sections or questions
-    - Maintain original order exactly
-    - Include ALL content between section headers
-    
-    Raw extracted text:
-    {raw_text[:40000]}
-    
-    Return ONLY the cleaned text with:
-    - Clear section headers
-    - Numbered questions
-    - Complete question text
+    Text to process:
+    {raw_text[:30000]}
     """
     
     try:
         response = model.generate_content(
             prompt,
-            generation_config={
-                "max_output_tokens": 8000,
-                "temperature": 0.1
-            }
+            generation_config={"max_output_tokens": 8000, "temperature": 0.1}
         )
         return response.text
     except Exception as e:
         st.error(f"Text refinement failed: {str(e)}")
         return raw_text
 
-def extract_sections(refined_text):
-    """Identify and extract document sections with questions from refined text"""
-    sections = []
-    current_section = {"title": "General Questions", "content": []}
+def extract_individual_questions(refined_text):
+    """Extract each question and sub-question separately"""
+    questions = []
+    current_question = ""
     
-    # Enhanced section detection with line context
-    section_patterns = [
-        r'(?:Section|Part|Set)\s*[A-Za-z0-9]+[.:]?\s*(.*)',
-        r'[A-Z]{3,}\s*[.:-]\s*(.*)',
-        r'\b(?:Questions?|Problems?)\b\s*(?:for|from|in)?\s*(.*)'
-    ]
+    # Enhanced pattern to capture question numbers and sub-parts
+    question_pattern = r'(?:\d+[a-z]?[\.\)]|\b[a-z][\.\)]).+?(?=\n\d+[a-z]?[\.\)]|\n\b[a-z][\.\)]|\Z)'
     
-    lines = refined_text.split('\n')
-    for i, line in enumerate(lines):
-        line = line.strip()
-        if not line:
-            continue
-            
-        section_found = False
-        for pattern in section_patterns:
-            match = re.match(pattern, line, re.IGNORECASE)
-            if match:
-                if current_section["content"]:
-                    sections.append(current_section)
-                current_section = {
-                    "title": line,
-                    "content": [],
-                    "start_line": i
-                }
-                section_found = True
-                break
-                
-        if not section_found and current_section:
-            if line.strip():
-                current_section["content"].append(line)
+    matches = re.finditer(question_pattern, refined_text, re.DOTALL)
+    for match in matches:
+        question_text = match.group().strip()
+        if question_text:
+            questions.append(question_text)
     
-    if current_section["content"]:
-        sections.append(current_section)
-        
-    # Verification - ensure no content was lost
-    total_lines = sum(len(s["content"]) for s in sections)
-    if total_lines < len([l for l in lines if l.strip()]):
-        st.warning("Some content may have been lost during section splitting")
-        
-    return sections
+    return questions
 
-def split_large_section(section):
-    """Split a large section into smaller chunks based on question count"""
-    chunks = []
-    current_chunk = []
-    question_count = 0
-    
-    for line in section["content"]:
-        current_chunk.append(line)
-        # Detect question starts (numbers followed by . or ) )
-        if re.match(r'^\d+[\.\)]', line.strip()):
-            question_count += 1
-            if question_count >= MAX_QUESTIONS_PER_CHUNK:
-                chunks.append({
-                    "title": f"{section['title']} (Part {len(chunks)+1})",
-                    "content": current_chunk
-                })
-                current_chunk = []
-                question_count = 0
-    
-    if current_chunk:
-        chunks.append({
-            "title": f"{section['title']} (Part {len(chunks)+1})" if chunks else section["title"],
-            "content": current_chunk
-        })
-    
-    return chunks
-
-def process_question_chunk(chunk_text, section_title, chunk_num=None):
-    """Process a chunk of questions with strict requirements"""
-    part_label = f" (Part {chunk_num})" if chunk_num else ""
+def process_single_question(question_text):
+    """Process one question to get complete solution"""
+    if not question_text.strip() or len(question_text.strip()) < 5:
+        return ""
+        
     prompt = f"""
-    Convert ALL questions in this section to HTML with EXACT structure:
-
+    For this exam question, provide:
+    1. Complete question text
+    2. Detailed step-by-step solution
+    3. Final answer
+    4. No need css or JS just keep the class and id same
+    5. No need for instruction and marking scheme
+    
+    Requirements:
+    - Skip any commentary about incompleteness
+    - Never include "```html" or code blocks
+    - If question is incomplete, just return the question text without solution
+    - Keep the exact HTML structure below
+    
+    Format exactly like this:
     <div class="question">
-        <p><strong>[Q.No]. [Full Question]</strong></p>
-        <button class="toggle-btn">Show Answer</button>
+        <p><strong>[Full Question]</strong></p>
+        <button class="toggle-btn">Show Solution</button>
         <div class="answer" style="display:none;">
             <div class="solution-steps">
                 <p><strong>Solution:</strong></p>
                 <ol>
-                    <li>[Step 1]</li>
-                    <li>[Step 2]</li>
+                    <li>[Step 1 explanation]</li>
+                    <li>[Step 2 working]</li>
                 </ol>
+                <p><strong>Final Answer:</strong> [Complete answer]</p>
             </div>
-            <p><strong>Answer:</strong> [Final answer]</p>
         </div>
     </div>
 
-    REQUIREMENTS:
-    1. Process ALL questions in order
-    2. Preserve original numbering
-    3. Include ALL sub-questions
-    4. Detailed step-by-step solutions
-    5. Use EXACT HTML structure above
-    6. Section: {section_title}{part_label}
-    7. No omissions - include everything
-    8. Complete all parts of each question
-    9. Do not include any commentary about truncation
-    10. Process only the questions provided
-
-    CONTENT:
-    {chunk_text}
+    Question to process:
+    {question_text}
     """
     
     try:
         response = model.generate_content(
             prompt,
             generation_config={
-                "max_output_tokens": 8000,
+                "max_output_tokens": MAX_QUESTION_TOKENS,
                 "temperature": 0.2
             }
         )
-        return response.text
+        cleaned_output = response.text.replace("```html", "").replace("```", "").strip()
+        return cleaned_output
+    except genai.types.BlockedPromptException:
+        return f"<div class='question'><p>⚠️ Question content blocked by safety filters</p></div>"
     except Exception as e:
-        return f"<div class='error'>Failed to process chunk: {str(e)}</div>"
-
-def process_section(section):
-    """Process a section, splitting into chunks if needed"""
-    section_content = "\n".join(section["content"])
-    
-    # Check if section needs splitting
-    if len(section_content) > MAX_SECTION_LENGTH:
-        chunks = split_large_section(section)
-        if len(chunks) > 1:
-            st.info(f"Splitting large section '{section['title']}' into {len(chunks)} parts")
-            
-            results = []
-            for i, chunk in enumerate(chunks):
-                chunk_text = "\n".join(chunk["content"])
-                result = process_question_chunk(chunk_text, section["title"], i+1)
-                results.append(result)
-                time.sleep(1)  # Rate limiting
-            return "\n".join(results)
-    
-    # Process as single chunk if not too large
-    return process_question_chunk(section_content, section["title"])
+        return f"<div class='error'>Error processing question: {str(e)}</div>"
 
 def convert_full_paper(raw_text):
-    """Two-stage conversion process with progress tracking"""
-    with st.status("Processing document...", expanded=True) as status:
+    """Process each question completely independently"""
+    with st.status("Processing...", expanded=True) as status:
         # Stage 1: Text refinement
-        status.write("🧹 Cleaning and structuring raw text...")
+        status.write("🧹 Extracting questions from text...")
         refined_text = refine_extracted_text(raw_text)
         
-        # Save refined text for verification
+        # Save refined text
         refined_path = os.path.join(OUTPUT_FOLDER, "refined_text.txt")
-        with open(refined_path, "w", encoding="utf-8") as f:
-            f.write(refined_text)
+        try:
+            with open(refined_path, "w", encoding="utf-8") as f:
+                f.write(refined_text)
+        except Exception as e:
+            st.error(f"Couldn't save refined text: {str(e)}")
         
-        # Stage 2: Section processing
-        sections = extract_sections(refined_text)
-        if not sections:
-            sections = [{"title": "Questions", "content": refined_text.split('\n')}]
+        # Stage 2: Extract individual questions
+        status.write("🔍 Identifying all questions...")
+        questions = extract_individual_questions(refined_text)
         
-        html_parts = [
-            """<div class="container">""",
-            """<h1>Exam Paper Solutions</h1>"""
-        ]
-        
+        # Stage 3: Process each question
+        html_parts = []
         progress_bar = st.progress(0)
-        status_text = st.empty()
-        total_questions = 0
+        processed_count = 0
         
-        # Process sections sequentially
-        for i, section in enumerate(sections):
-            status_text.text(f"📝 Converting {section['title']} ({i+1}/{len(sections)})...")
-            progress_bar.progress((i + 1) / (len(sections) + 1))
+        for i, question in enumerate(questions):
+            if i >= MAX_REQUESTS_PER_MINUTE:
+                st.warning(f"Stopped after {MAX_REQUESTS_PER_MINUTE} questions (API limit)")
+                break
+                
+            progress = (i + 1) / min(len(questions), MAX_REQUESTS_PER_MINUTE)
+            progress_bar.progress(progress)
+            status.write(f"📝 Processing question {i+1}/{len(questions)}...")
+            st.toast(f"Processing question {i+1}", icon="⏳")
             
-            section_html = process_section(section)
-            html_parts.append(f"""
-            <section id="section-{i+1}">
-                <h2>{section['title']}</h2>
-                {section_html}
-            </section>
-            """)
-            
-            # Update question count
-            total_questions += section_html.count('class="question"')
+            question_html = process_single_question(question)
+            if question_html:
+                html_parts.append(question_html)
+                processed_count += 1
+            time.sleep(DELAY_BETWEEN_QUESTIONS)
         
-        # Finalize HTML
-        html_parts.extend([
-            "</div>",
-            """
-            <script>
-            document.querySelectorAll('.toggle-btn').forEach(btn => {
-                btn.addEventListener('click', function() {
-                    const answer = this.nextElementSibling;
-                    answer.style.display = answer.style.display === 'none' ? 'block' : 'none';
-                    this.textContent = answer.style.display === 'none' ? 'Show Answer' : 'Hide Answer';
-                });
-            });
-            </script>
-            """
-        ])
-        
-        progress_bar.progress(1.0)
-        status_text.text(f"✅ Conversion complete! Processed {total_questions} questions")
-        status.update(label="Processing Complete!", state="complete", expanded=False)
-        
-        return "\n".join(html_parts), refined_path
+        full_html = "\n".join(html_parts)
+        status.success(f"✅ Processed {processed_count} questions")
+        return full_html, refined_path
 
 def main():
     # Clear old files
-    for folder in [UPLOAD_FOLDER, OUTPUT_FOLDER]:
-        for filename in os.listdir(folder):
-            file_path = os.path.join(folder, filename)
-            try:
-                if os.path.isfile(file_path):
-                    os.unlink(file_path)
-            except Exception as e:
-                st.warning(f"Couldn't clear {file_path}: {e}")
+    cleanup()
     
     st.title("📄 Smart Paper Converter")
     st.markdown("Convert PDF question papers to interactive HTML with solutions")
+    
+    # API call log section
+    st.sidebar.title("API Call Transparency")
+    st.sidebar.info("Below are all Gemini API calls made during processing")
     
     uploaded_file = st.file_uploader(
         "Upload Question Paper PDF",
@@ -368,8 +271,12 @@ def main():
         except Exception as e:
             st.error(f"Processing failed: {str(e)}")
         finally:
-            if os.path.exists(file_path):
-                os.remove(file_path)
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+            except:
+                pass
 
 if __name__ == "__main__":
     main()
+    cleanup()  # Final cleanup

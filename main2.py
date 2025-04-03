@@ -4,12 +4,17 @@ import time
 import google.generativeai as genai
 from pdf_processor2 import process_pdf
 import re
+from dotenv import load_dotenv
 
+# Load environment variables from .env file
+load_dotenv()
+
+# Get the API key
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 # Configuration
 UPLOAD_FOLDER = "uploads"
 OUTPUT_FOLDER = "outputs"
 MAX_FILE_SIZE = 200  # MB
-GEMINI_API_KEY = "AIzaSyDMCXugVyrMIFP4KH1DJ56uBE6wMDWODgc"
 MAX_QUESTION_TOKENS = 4000  # Tokens per individual question
 DELAY_BETWEEN_QUESTIONS = 1  # Seconds
 
